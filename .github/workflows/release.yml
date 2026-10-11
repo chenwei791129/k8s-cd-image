@@ -1,0 +1,146 @@
+name: Release image versions
+
+# Decides which image versions (`vX.Y.Z.R`) should exist and creates their
+# version tags; build-and-push.yml then builds and publishes every pushed
+# version tag.
+#
+# The supported kubectl versions are the latest patch of each of the three
+# newest Kubernetes minors, read from dl.k8s.io (the GitHub releases API's
+# `latest` release only ever covers the newest minor). For each of them:
+#   - no version tag yet: tag `vX.Y.Z.0`;
+#   - the Dockerfile differs from the one the newest image revision was built
+#     from, or `force` is set: tag the next image revision;
+#   - otherwise: nothing to do.
+# Every trigger runs the same check against the current state, so a run can be
+# repeated safely and a failed or skipped run is caught up by the next one.
+# Only Dockerfile changes produce a new image revision; workflow changes are
+# verified by the pull request build instead.
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+  workflow_dispatch:
+    inputs:
+      force:
+        description: >-
+          Release a new image revision of every supported kubectl version even
+          if the Dockerfile has not changed.
+        required: false
+        type: boolean
+        default: false
+
+# Runs are queued, never run in parallel. A newer run may replace a queued one,
+# which is safe because each run checks the full state again; only a queued
+# `force` dispatch is lost that way and has to be started again.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      # Tags are pushed with PUSH_PAT, not with the default token.
+      contents: read
+    steps:
+      - name: Check the ref
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Run this workflow from main, not ${REF}"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Always the current main, also when an older run is re-run, so a
+          # new image revision is never tagged on an outdated Dockerfile.
+          ref: main
+          # The existing version tags and their history are needed.
+          fetch-depth: 0
+          # Tags pushed with the default GITHUB_TOKEN do not trigger other
+          # workflows, so a PAT is used to let build-and-push.yml run.
+          token: ${{ secrets.PUSH_PAT }}
+
+      - name: Tag new image versions
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          semver_re='^v([0-9]+)\.([0-9]+)\.[0-9]+$'
+
+          fetch_version() {
+            local url="https://dl.k8s.io/release/$1.txt" version
+            version=$(curl -fsSL "${url}")
+            if [[ ! "${version}" =~ ${semver_re} ]]; then
+              echo "::error::Unexpected ${url} content: ${version}" >&2
+              return 1
+            fi
+            echo "${version}"
+          }
+
+          stable=$(fetch_version stable)
+          [[ "${stable}" =~ ${semver_re} ]]
+          major="${BASH_REMATCH[1]}"
+          newest_minor="${BASH_REMATCH[2]}"
+
+          # Tool versions recorded in each tag message.
+          tools=$(
+            sed -nE 's/^ARG ([A-Z_]+_VERSION)=(.+)$/\1=\2/p' Dockerfile
+            sed -nE 's/^FROM (alpine:[^ ]+)$/base image: \1/p' Dockerfile
+          )
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "github-actions[bot]@users.noreply.github.com"
+
+          # Newest minor first, so a build never sees a lower kubectl version
+          # tagged before a higher one and claims the `latest` tag for it.
+          for minor in $(seq "${newest_minor}" -1 $((newest_minor - 2))); do
+            version=$(fetch_version "stable-${major}.${minor}")
+            # The minor has to match: stable-X.Y.txt must not point elsewhere.
+            if [[ "${version}" != "v${major}.${minor}."* ]]; then
+              echo "::error::stable-${major}.${minor}.txt points to ${version}"
+              exit 1
+            fi
+
+            previous=$(
+              git tag --list "${version}.*" |
+                { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true; } |
+                sort -V | tail -n 1
+            )
+            if [[ -z "${previous}" ]]; then
+              tag="${version}.0"
+              changes="Initial image for kubectl ${version}."
+            elif [[ "${FORCE}" == true ]] ||
+              ! git diff --quiet "${previous}" HEAD -- Dockerfile; then
+              tag="${version}.$(( ${previous##*.} + 1 ))"
+              log=$(git log --oneline "${previous}..HEAD")
+              changes="Changes since ${previous}:"$'\n'"${log:-(none, forced)}"
+            else
+              echo "${previous} is up to date"
+              continue
+            fi
+
+            # The message is outdented so that, once YAML strips the block
+            # indentation, it starts in column 0 and EOF ends the heredoc.
+            git tag -a "${tag}" -F - <<EOF
+          Release ${tag}
+
+          kubectl ${version}
+          ${tools}
+
+          ${changes}
+          EOF
+            # One push per tag: GitHub creates no push events at all when more
+            # than three tags are pushed at once. If another run pushed the
+            # same tag first, the push fails and the next run catches up.
+            git push origin "refs/tags/${tag}"
+            echo "Tagged ${tag}"
+          done
