@@ -1,45 +1,35 @@
 name: Build and push image
 
-# One image is published per kubectl version, tagged `X.Y.Z` and `X.Y`. The
-# other tools are pinned in the Dockerfile, so the plan job below decides which
-# kubectl versions a run builds:
-#   - a pushed `vX.Y.Z` git tag (created by autocheck.yml) builds that version;
-#   - a push to main that changes the image (e.g. Renovate bumping helm, yq or
-#     the Alpine base) rebuilds the latest patch of the three newest kubectl
-#     minors already tagged here, so every supported tag picks up the change;
-#   - workflow_dispatch (from main only, since it publishes) builds
-#     kubectl_version, or the supported set when empty;
-#   - a pull request builds the newest tagged version without pushing it.
+# Builds the image versions that release.yml tags. Every image version
+# `X.Y.Z.R` (kubectl version `vX.Y.Z` plus image revision R) is built once from
+# the commit its version tag `vX.Y.Z.R` points to and never pushed again. The
+# floating tags are moved along with it:
+#   - `X.Y.Z` when R is the newest image revision of that kubectl version;
+#   - `X.Y` when, in addition, X.Y.Z is the newest version-tagged patch of the
+#     minor;
+#   - `latest` when, in addition, X.Y.Z is the highest version-tagged kubectl
+#     version.
+# A pull request builds the newest kubectl version without pushing it.
+#
+# A failed tag build is retried with "Re-run all jobs", so the plan sees the
+# current version tags again ("Re-run failed jobs" would reuse the old plan).
+# If the image version was already pushed, the re-run does nothing, so an
+# image whose signing failed has to be signed by hand. When two image versions
+# that share a floating tag build at the same time, that tag can end on the
+# one that finishes last until another image version moves it (e.g. a `force`
+# release).
 on:
   push:
-    branches: [main]
-    tags: ['v*']
-    # Path filters are not evaluated for tag pushes, so every tag still builds.
-    paths:
-      - Dockerfile
-      - .github/workflows/build-and-push.yml
+    # Only version tags; the three-part `vX.Y.Z` tags are history.
+    tags: ['v*.*.*.*']
   pull_request:
-  workflow_dispatch:
-    inputs:
-      kubectl_version:
-        description: >-
-          kubectl version to build, e.g. v1.36.5. Leave empty to rebuild
-          every supported version.
-        required: false
-        type: string
 
-# Superseded pull request runs are cancelled. Main rebuilds (pushes and
-# dispatches without kubectl_version) share one group: they are queued rather
-# than run in parallel, and a newer one replaces a queued one, so the image
-# built from the newest main commit is pushed last. Each tag build and each
-# single-version dispatch has its own group and is never cancelled; if one
-# overlaps a main rebuild, whichever finishes last sets that version's `X.Y.Z`,
-# `X.Y` and `latest` until the next build of it.
+# Superseded pull request runs are cancelled. Each tag build has its own group
+# and is never cancelled.
 concurrency:
   group: >-
     ${{ github.workflow }}-${{ github.event_name == 'pull_request'
-    && github.event.pull_request.number
-    || format('{0}-{1}', github.ref, inputs.kubectl_version) }}
+    && github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions: {}
@@ -50,53 +40,106 @@ jobs:
     permissions:
       contents: read
     outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
+      build: ${{ steps.plan.outputs.build }}
+      kubectl_version: ${{ steps.plan.outputs.kubectl_version }}
+      tags: ${{ steps.plan.outputs.tags }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The released versions are read from the git tags.
+          # The floating tags are derived from all version tags.
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Decide which kubectl versions to build
+      - name: Decide what to build
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
-          REF: ${{ github.ref }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
-          INPUT_VERSION: ${{ inputs.kubectl_version }}
+          IMAGE: ghcr.io/${{ github.repository }}
         run: |
           set -euo pipefail
-          semver_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
 
-          mapfile -t released < <(
-            git tag --list 'v*' | grep -E "${semver_re}" | sort -V
-          )
-          if (( ${#released[@]} == 0 )); then
-            echo "::error::No vX.Y.Z tags found"
-            exit 1
-          fi
-          newest="${released[-1]}"
+          # Lists the version tags (vX.Y.Z.R) matching a git tag pattern.
+          version_tags() {
+            git tag --list "$1" |
+              { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true; }
+          }
 
-          # An empty request means "rebuild the supported versions".
-          requested=""
+          # Prints the newest version-tagged kubectl version (vX.Y.Z)
+          # matching a git tag pattern, or nothing.
+          newest_kubectl() {
+            version_tags "$1" | sed -E 's/\.[0-9]+$//' | sort -V | tail -n 1
+          }
+
+          output() {
+            echo "$1=$2"
+            echo "$1=$2" >> "${GITHUB_OUTPUT}"
+          }
+
           case "${EVENT_NAME}" in
             push)
-              if [[ "${REF_TYPE}" == tag ]]; then
-                requested="${REF_NAME}"
-              fi
-              ;;
-            workflow_dispatch)
-              if [[ "${REF}" != refs/heads/main ]]; then
-                echo "::error::Run this workflow from main, not ${REF}"
+              if [[ "${REF_TYPE}" != tag ||
+                ! "${REF_NAME}" =~ ^(v([0-9]+\.[0-9]+)\.[0-9]+)\.[0-9]+$ ]]
+              then
+                echo "::error::'${REF_NAME}' is not a vX.Y.Z.R version tag"
                 exit 1
               fi
-              requested="${INPUT_VERSION}"
+              kubectl_version="${BASH_REMATCH[1]}"
+              minor="${BASH_REMATCH[2]}"
+              image_version="${REF_NAME#v}"
+
+              # An image version is never pushed twice, so re-running the
+              # build of a published one does nothing.
+              if inspect=$(skopeo inspect --raw \
+                "docker://${IMAGE}:${image_version}" 2>&1); then
+                echo "::notice::${IMAGE}:${image_version} already exists"
+                output build false
+                exit 0
+              elif [[ "${inspect}" != *"manifest unknown"* ]]; then
+                echo "${inspect}"
+                echo "::error::Cannot check ${IMAGE}:${image_version}"
+                exit 1
+              fi
+
+              newest_revision=$(
+                version_tags "${kubectl_version}.*" | sort -V | tail -n 1
+              )
+              newest_patch=$(newest_kubectl "v${minor}.*")
+              newest=$(newest_kubectl 'v*')
+
+              # metadata-action tag rules. The image version has the highest
+              # priority, so it also becomes the
+              # org.opencontainers.image.version label. Each floating tag
+              # requires the previous one.
+              tags="type=raw,value=${image_version},priority=1000"
+              if [[ "${REF_NAME}" == "${newest_revision}" ]]; then
+                tags+=$'\n'"type=raw,value=${kubectl_version#v}"
+                if [[ "${kubectl_version}" == "${newest_patch}" ]]; then
+                  tags+=$'\n'"type=raw,value=${minor}"
+                  if [[ "${kubectl_version}" == "${newest}" ]]; then
+                    tags+=$'\n'"type=raw,value=latest"
+                  fi
+                fi
+              fi
               ;;
             pull_request)
-              requested="${newest}"
+              # Nothing is pushed, so only the kubectl version matters. Before
+              # the first version tag exists, the history tags are used.
+              kubectl_version=$(newest_kubectl 'v*')
+              if [[ -z "${kubectl_version}" ]]; then
+                kubectl_version=$(
+                  git tag --list 'v*' |
+                    { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } |
+                    sort -V | tail -n 1
+                )
+              fi
+              if [[ -z "${kubectl_version}" ]]; then
+                echo "::error::No kubectl version tags found"
+                exit 1
+              fi
+              tags=""
               ;;
             *)
               echo "::error::Unsupported event: ${EVENT_NAME}"
@@ -104,57 +147,19 @@ jobs:
               ;;
           esac
 
-          if [[ -n "${requested}" ]]; then
-            if [[ ! "${requested}" =~ ${semver_re} ]]; then
-              echo "::error::'${requested}' is not a vX.Y.Z kubectl version"
-              exit 1
-            fi
-            versions=("${requested}")
-          else
-            # Latest patch of each of the three newest minors, newest first.
-            mapfile -t versions < <(
-              printf '%s\n' "${released[@]}" | awk -F. '
-                {
-                  minor = $1 "." $2
-                  if (!(minor in last)) order[++n] = minor
-                  last[minor] = $0
-                }
-                END {
-                  for (i = n; i > 0 && i > n - 3; i--) print last[order[i]]
-                }'
-            )
-          fi
-
-          # `latest` and `X.Y` are only published for the highest tagged
-          # version overall and within its minor, so rebuilding or
-          # back-filling an older version never moves them backwards. A
-          # dispatched version without a git tag only gets `X.Y.Z`. (Pull
-          # requests compute these too, but push nothing.)
-          matrix=$(
-            for version in "${versions[@]}"; do
-              minor="${version%.*}"
-              top_in_minor=$(printf '%s\n' "${released[@]}" |
-                awk -F. -v minor="${minor}" '($1 "." $2) == minor' |
-                tail -n 1)
-              jq -cn \
-                --arg version "${version}" \
-                --arg minor "${minor#v}" \
-                --arg newest "${newest}" \
-                --arg top_in_minor "${top_in_minor}" \
-                '{version: $version, minor: $minor,
-                  latest: ($version == $newest),
-                  minor_latest: ($version == $top_in_minor)}'
-            done | jq -cs .
-          )
-          echo "Build plan: ${matrix}"
-          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+          output build true
+          output kubectl_version "${kubectl_version}"
+          echo "Tag rules:"
+          echo "${tags}"
+          {
+            echo "tags<<EOF_TAGS"
+            echo "${tags}"
+            echo "EOF_TAGS"
+          } >> "${GITHUB_OUTPUT}"
 
   build:
     needs: plan
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    if: needs.plan.outputs.build == 'true'
     permissions:
       contents: read
       packages: write
@@ -163,15 +168,13 @@ jobs:
       id-token: write
     uses: chenwei791129/.github/.github/workflows/build-and-push-image.yml@main
     with:
-      # The semver tags are derived from the matrix version rather than the
-      # git ref, so branch pushes and dispatches produce the same tags as tag
-      # pushes.
       enable-branch-tag: false
       enable-semver-tags: false
-      enable-latest-tag: ${{ matrix.latest }}
-      additional-tags: |
-        type=semver,pattern={{version}},value=${{ matrix.version }}
-        type=raw,value=${{ matrix.minor }},enable=${{ matrix.minor_latest }}
+      # metadata-action's `latest=auto` only adds `latest` for semver, pep440,
+      # match and tag-ref rules, not for raw ones, so the plan job decides
+      # `latest` as a raw rule too.
+      enable-latest-tag: false
+      additional-tags: ${{ needs.plan.outputs.tags }}
       build-args: |
-        KUBECTL_VERSION=${{ matrix.version }}
+        KUBECTL_VERSION=${{ needs.plan.outputs.kubectl_version }}
       sign-image: true
