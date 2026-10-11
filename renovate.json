@@ -3,5 +3,12 @@
   "extends": [
     "config:recommended",
     "customManagers:dockerfileVersions"
+  ],
+  "packageRules": [
+    {
+      "description": "Every Dockerfile change releases a new image revision of each supported kubectl version, so the Alpine base and the pinned tools are updated in one pull request.",
+      "matchFileNames": ["Dockerfile"],
+      "groupName": "image dependencies"
+    }
   ]
 }
