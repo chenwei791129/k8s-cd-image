@@ -1,4 +1,4 @@
-[![Build and push image](https://github.com/chenwei791129/k8s-cd-image/actions/workflows/build-and-push.yml/badge.svg)](https://github.com/chenwei791129/k8s-cd-image/actions/workflows/build-and-push.yml)
+[![Release image versions](https://github.com/chenwei791129/k8s-cd-image/actions/workflows/release.yml/badge.svg)](https://github.com/chenwei791129/k8s-cd-image/actions/workflows/release.yml)
 
 # k8s-cd-image
 
@@ -8,7 +8,7 @@ Alpine-based Docker image with Kubernetes CD tools for CI/CD pipelines.
 
 | Tool | Description |
 |------|-------------|
-| **kubectl** | Kubernetes CLI (the image tag is the kubectl version) |
+| **kubectl** | Kubernetes CLI (the first three parts of the image version) |
 | **kustomize** | Kubernetes configuration customization |
 | **helm** | Kubernetes package manager |
 | **helm-diff** | Helm plugin for diffing releases |
@@ -21,11 +21,12 @@ Alpine-based Docker image with Kubernetes CD tools for CI/CD pipelines.
 
 kustomize, helm, helm-diff and yq are pinned in the [Dockerfile](Dockerfile),
 together with the Alpine base image, and updated through Renovate pull
-requests. kubectl is downloaded in the version of the image tag; bash, curl,
-git, ssh, jq and envsubst are Alpine packages from the pinned release. Each
-downloaded binary is verified against the checksum file published with its
-release, and the build fails if any tool cannot run. The pinned versions are
-recorded as image labels:
+requests. kubectl is downloaded in the kubectl version the image is built for;
+bash, curl, git, ssh, jq and envsubst are Alpine packages from the pinned
+release. Each downloaded binary is verified against the checksum file published
+with its release, and the build fails if any tool cannot run. The pinned versions are
+recorded as image labels, and the `org.opencontainers.image.version` label is
+the image version (`X.Y.Z.R`):
 
 ```bash
 docker pull ghcr.io/chenwei791129/k8s-cd-image:latest
@@ -35,20 +36,42 @@ docker image inspect ghcr.io/chenwei791129/k8s-cd-image:latest \
 
 ## Tags
 
-| Tag | Points to |
-|-----|-----------|
-| `X.Y.Z` | kubectl `vX.Y.Z` |
-| `X.Y` | the latest kubectl patch of minor `X.Y` |
-| `latest` | the highest kubectl version published |
+Every published image has an image version `X.Y.Z.R`: the kubectl version
+`X.Y.Z` plus an image revision `R` that starts at `0` and grows by one each
+time an image with different content is published for the same kubectl
+version. An image version is pushed once and never moved. The other tags float
+to the newest image version they cover:
 
-The latest patch of the three newest Kubernetes minor versions is tagged and
-published automatically every day. Whenever a bundled tool or the Alpine base
-is updated, those tags are rebuilt and pushed again, so a tag can move to a new
-image. Pin the image by digest (`ghcr.io/chenwei791129/k8s-cd-image@sha256:...`)
-if you need it to stay unchanged. In the rare case that another build (for a
-newly released kubectl version, or a manual build) runs at the same time as
-such a rebuild, whichever finishes last decides where the tags they share
-point until the next build.
+| Tag | Points to | Moves |
+|-----|-----------|-------|
+| `X.Y.Z.R` | one image of kubectl `vX.Y.Z` | never |
+| `X.Y.Z` | the newest image revision of kubectl `vX.Y.Z` | yes |
+| `X.Y` | the newest image of the latest published patch of minor `X.Y` | yes |
+| `latest` | the newest image of the highest kubectl version published | yes |
+
+Pin `X.Y.Z.R` (or a digest, `ghcr.io/chenwei791129/k8s-cd-image@sha256:...`)
+if you need the image to stay unchanged; Renovate can update a pinned `X.Y.Z.R`
+to the next image revision.
+
+Only the supported kubectl versions, the latest patch of each of the three
+newest Kubernetes minors, receive new image versions. A new image version is
+released when:
+
+- a new supported kubectl version appears (checked daily): `X.Y.Z.0`;
+- the [Dockerfile](Dockerfile) changes on `main`, e.g. a Renovate update of a
+  bundled tool or the Alpine base: the next image revision of every supported
+  kubectl version;
+- a maintainer runs the release workflow with `force`.
+
+Older kubectl patches keep their last image version; images published before
+image versions were introduced, and not converted to one, keep their
+three-part `X.Y.Z` tag. In the rare case that two image versions that share a
+floating tag are built at the same time (e.g. a new image revision and a new
+kubectl patch of the same minor), that floating tag can stay on the one that
+finishes last until another image version moves it. Each image version
+has an annotated git tag `vX.Y.Z.R` on the commit it was built from; its
+message lists the bundled tool versions and the changes since the previous
+image revision.
 
 ## Usage
 
@@ -104,8 +127,9 @@ cosign verify ghcr.io/chenwei791129/k8s-cd-image:latest \
 
 ## Build
 
-`KUBECTL_VERSION` is required; the other tool versions default to the ones
-pinned in the Dockerfile.
+`KUBECTL_VERSION` is required and is the kubectl version without the image
+revision (e.g. `v1.37.1` for image version `1.37.1.0`); the other tool versions
+default to the ones pinned in the Dockerfile.
 
 ```bash
 docker buildx build \
