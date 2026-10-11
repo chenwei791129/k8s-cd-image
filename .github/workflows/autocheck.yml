@@ -1,46 +1,63 @@
-name: Auto check and create tag when kubectl new version released
+name: Tag new kubectl releases
 
+# Kubernetes maintains its three newest minor versions, so the latest patch of
+# each of them gets a `vX.Y.Z` git tag here; build-and-push.yml then builds and
+# publishes every pushed tag. The versions come from dl.k8s.io instead of the
+# GitHub releases API, whose `latest` release only ever covers the newest minor.
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
 
-jobs:     
+permissions: {}
+
+jobs:
   check-and-tag:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      # Tags are pushed with PUSH_PAT, not with the default token.
+      contents: read
     steps:
-      - name: Check new version
-        id: newversion
-        run: echo "NEW_VERSION=$(curl -s https://api.github.com/repos/kubernetes/kubernetes/releases/latest | jq -r '.tag_name')" >> $GITHUB_OUTPUT
-      - name: Print new version
-        run: echo new version is ${{ steps.newversion.outputs.NEW_VERSION }}
-      - name: Check version not exist
-        uses: mukunku/tag-exists-action@v1.7.0
-        id: checkexist
-        env:
-          # Use PAT instead of GITHUB_TOKEN to enable triggering other workflows
-          # GITHUB_TOKEN cannot trigger workflows on tag push events for security reasons
-          GITHUB_TOKEN: ${{ secrets.PUSH_PAT }}
-        with: 
-          tag: ${{ steps.newversion.outputs.NEW_VERSION }}
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Use PAT to allow tag creation that can trigger build-and-push workflow
-          # Default GITHUB_TOKEN prevents triggering workflows from automated tag pushes
+          # Existing tags are needed to skip versions that are already tagged.
+          fetch-depth: 0
+          # Tags pushed with the default GITHUB_TOKEN do not trigger other
+          # workflows, so a PAT is used to let build-and-push.yml run.
           token: ${{ secrets.PUSH_PAT }}
-      - name: Add tag when new version released
-        if: ${{ steps.checkexist.outputs.exists != 'true' }}
-        uses: rickstaa/action-create-tag@v1
-        with:
-          tag: ${{ steps.newversion.outputs.NEW_VERSION }}
-          # Use PAT to ensure the created tag can trigger the build-and-push workflow
-          github_token: ${{ secrets.PUSH_PAT }}
-      - name: Push tag to remote
-        if: ${{ steps.checkexist.outputs.exists != 'true' }}
+
+      - name: Tag the latest patch of each supported minor
         run: |
+          set -euo pipefail
+          semver_re='^v([0-9]+)\.([0-9]+)\.[0-9]+$'
+
+          stable=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          if [[ ! "${stable}" =~ ${semver_re} ]]; then
+            echo "::error::Unexpected stable.txt content: ${stable}"
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}"
+          newest_minor="${BASH_REMATCH[2]}"
+
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch --tags
-          git push origin ${{ steps.newversion.outputs.NEW_VERSION }} --tags
+          git config user.email \
+            "github-actions[bot]@users.noreply.github.com"
+
+          for minor in $(seq $((newest_minor - 2)) "${newest_minor}"); do
+            url="https://dl.k8s.io/release/stable-${major}.${minor}.txt"
+            version=$(curl -fsSL "${url}")
+            if [[ ! "${version}" =~ ${semver_re} ]]; then
+              echo "::error::Unexpected ${url} content: ${version}"
+              exit 1
+            fi
+            if git rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
+              echo "${version} is already tagged"
+              continue
+            fi
+            git tag -a "${version}" -m "Release ${version}"
+            # One push per tag: GitHub creates no push events at all when more
+            # than three tags are pushed at once.
+            git push origin "refs/tags/${version}"
+            echo "Tagged ${version}"
+          done
