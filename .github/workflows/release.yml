@@ -43,7 +43,7 @@ permissions: {}
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       # Tags are pushed with PUSH_PAT, not with the default token.
       contents: read
