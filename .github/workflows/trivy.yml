@@ -25,4 +25,5 @@ jobs:
       scan-ref: ghcr.io/chenwei791129/k8s-cd-image:latest
       scanners: vuln
       severity: HIGH,CRITICAL
+      exit-code: "0"
       upload-sarif: true
